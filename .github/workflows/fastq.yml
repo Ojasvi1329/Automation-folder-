@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       request_id:
-        description: 'Request/Project ID (e.g., 09297, 09297_B)'
+        description: 'Request/Project ID '
         required: true
         type: string
       drive:
-        description: 'Drive (e.g., sunj, lowes, BIC_DRAGEN)'
+        description: 'Drive'
         required: true
         type: string
 
