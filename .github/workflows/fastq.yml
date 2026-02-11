@@ -1,0 +1,133 @@
+# =============================================================================
+# FASTQ Restoration Workflow
+# =============================================================================
+name: FASTQ Restoration
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'Request/Project ID (e.g., 09297, 09297_B)'
+        required: true
+        type: string
+      drive:
+        description: 'Drive (e.g., sunj, lowes, BIC_DRAGEN)'
+        required: true
+        type: string
+
+jobs:
+  restore:
+    name: Restore ${{ github.event.inputs.request_id }}
+    runs-on: [self-hosted, igo-ln01]
+    
+    steps:
+      # ═══════════════════════════════════════════════════════════════════════
+      # Step 1: Restore from tape archive (SSH to is01)
+      # ═══════════════════════════════════════════════════════════════════════
+      - name: "1️⃣ Restore from tape (is01)"
+        id: restore
+        run: |
+          echo "🗄️ Restoring ${{ github.event.inputs.request_id }} from tape..."
+          
+          OUTPUT=$(ssh -o StrictHostKeyChecking=no patelo2@is01.mskcc.org \
+            "sudo -i -u igo bash -c 'cd ~ && python copy_files_back.py ${{ github.event.inputs.request_id }}'")
+          
+          echo "$OUTPUT"
+          
+          # Extract run_folder from output
+          RUN_FOLDER=$(echo "$OUTPUT" | grep -oP '/igo/staging/FASTQ/\K[^/]+' | head -1)
+          
+          if [ -z "$RUN_FOLDER" ]; then
+            echo "❌ Could not extract run folder!"
+            exit 1
+          fi
+          
+          RUN_NAME=$(echo "$RUN_FOLDER" | cut -d'_' -f1,2)
+          
+          echo "✅ Run folder: $RUN_FOLDER"
+          echo "run_folder=$RUN_FOLDER" >> $GITHUB_OUTPUT
+          echo "run_name=$RUN_NAME" >> $GITHUB_OUTPUT
+
+      # ═══════════════════════════════════════════════════════════════════════
+      # Step 2: Create markers (LOCAL on igo-ln01)
+      # ═══════════════════════════════════════════════════════════════════════
+      - name: "2️⃣ Create markers (igo-ln01)"
+        run: |
+          RUN_FOLDER="${{ steps.restore.outputs.run_folder }}"
+          
+          cp /ifs/rtsia01/igo/FASTQ/$RUN_FOLDER/fastq.md5.input \
+             /igo/staging/FASTQ/$RUN_FOLDER/ 2>/dev/null || true
+          
+          touch /igo/staging/FASTQ/$RUN_FOLDER/RTAComplete.txt
+          
+          echo "✅ Markers created"
+
+      # ═══════════════════════════════════════════════════════════════════════
+      # Step 3: Wait for sync (LOCAL on igo-ln01)
+      # ═══════════════════════════════════════════════════════════════════════
+      - name: "3️⃣ Wait for sync"
+        run: |
+          RUN_FOLDER="${{ steps.restore.outputs.run_folder }}"
+          REQUEST_ID="${{ github.event.inputs.request_id }}"
+          DELIVERY="/igo/delivery/FASTQ/$RUN_FOLDER/Project_$REQUEST_ID"
+          
+          echo "⏳ Waiting for sync to: $DELIVERY"
+          
+          for i in $(seq 1 60); do
+            if [ -d "$DELIVERY" ]; then
+              COUNT=$(find "$DELIVERY" -name "*.fastq.gz" 2>/dev/null | wc -l)
+              if [ "$COUNT" -gt 0 ]; then
+                echo "✅ Sync complete! $COUNT files found"
+                exit 0
+              fi
+            fi
+            echo "   waiting... ($((i/2)) min)"
+            sleep 30
+          done
+          
+          echo "❌ Timeout after 30 minutes"
+          exit 1
+
+      # ═══════════════════════════════════════════════════════════════════════
+      # Step 4: Link & ACLs (SSH to igo-acl01)
+      # ═══════════════════════════════════════════════════════════════════════
+      - name: "4️⃣ Link & ACLs (igo-acl01)"
+        run: |
+          ssh -o StrictHostKeyChecking=no patelo2@igo-acl01.mskcc.org \
+            "sudo -i -u igo bash -c 'cd ~/igo-delivery && python3 LinkProjectToSamples.py REQUEST=${{ github.event.inputs.request_id }}'"
+          
+          echo "✅ Linking complete"
+
+      # ═══════════════════════════════════════════════════════════════════════
+      # Step 5: Verify
+      # ═══════════════════════════════════════════════════════════════════════
+      - name: "5️⃣ Verify"
+        run: |
+          REQUEST_ID="${{ github.event.inputs.request_id }}"
+          DRIVE="${{ github.event.inputs.drive }}"
+          RUN_NAME="${{ steps.restore.outputs.run_name }}"
+          RUN_FOLDER="${{ steps.restore.outputs.run_folder }}"
+          
+          RESULT=$(ssh -o StrictHostKeyChecking=no patelo2@igo-acl01.mskcc.org \
+            "sudo -i -u igo bash -c '
+              SHARE=\"/igo/delivery/share/$DRIVE/Project_$REQUEST_ID\"
+              SAMPLES=\$(ls \$SHARE/$RUN_NAME/ 2>/dev/null | wc -l)
+              ACL=\$(cat \$SHARE/acl_permissions.txt 2>/dev/null)
+              echo \"SAMPLES:\$SAMPLES\"
+              echo \"ACL:\$ACL\"
+            '")
+          
+          SAMPLES=$(echo "$RESULT" | grep "SAMPLES:" | cut -d':' -f2)
+          
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "✅ RESTORATION COMPLETE"
+          echo "════════════════════════════════════════════════════════════════"
+          echo "📋 Request:  $REQUEST_ID"
+          echo "📂 Run:      $RUN_FOLDER"
+          echo "📁 Location: /igo/delivery/share/$DRIVE/Project_$REQUEST_ID/$RUN_NAME/"
+          echo "📊 Samples:  $SAMPLES"
+          echo ""
+          echo "🔐 ACL Permissions:"
+          echo "$RESULT" | grep -A20 "ACL:" | tail -n +1
+          echo "════════════════════════════════════════════════════════════════"
